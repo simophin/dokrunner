@@ -1,0 +1,24 @@
+[package]
+name = "kdashdoc"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+log = "0"
+env_logger = "0"
+anyhow = "1"
+sqlx = { version = "0", default-features = false, features = [
+    "sqlite",
+    "json",
+    "runtime-tokio-rustls",
+    "macros"
+] }
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "fs"] }
+zbus = { version = "3", default-features = false, features = ["tokio"] }
+dirs = "4"
+maplit = "1"
+async-trait = "0"
+serde = "1"
+serde_json = "1"
