@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::{collections::HashMap, sync::Arc, vec};
 
 use maplit::hashmap;
@@ -46,17 +45,13 @@ enum QueryPropertyField {
     Category,
     Urls,
     Subtext,
-    Actions,
-    Multiline,
-    #[serde(rename = "icon-data")]
-    IconData,
 }
 
-#[derive(Serialize, Type, Default)]
+#[derive(Serialize, Type)]
 struct QueryEntry {
-    id: Cow<'static, str>,
-    display_text: Cow<'static, str>,
-    icon_name: Cow<'static, str>,
+    data: Arc<str>,
+    display_text: Arc<str>,
+    icon_name: Arc<str>,
     match_type: MatchType,
     relevance: f64,
     properties: HashMap<QueryPropertyField, Value<'static>>,
@@ -102,23 +97,21 @@ impl KRunnerPlugin {
                 if query.is_empty() {
                     return doc_sets
                         .into_iter()
-                        .map(
+                        .flat_map(
                             |DocSet {
                                  id,
                                  name,
-                                 keyword,
+                                 keywords,
                                  icon,
                                  ..
-                             }| QueryEntry {
-                                id: Cow::Owned(format!("docset-intro-{id}")),
-                                display_text: Cow::Owned(format!(
-                                    "Type \"{keyword} keyword\" to search {name}"
-                                )),
-                                icon_name: icon,
+                             }| keywords.into_iter().map(move |keyword| QueryEntry {
+                                data: format!("docset-intro-{id}").into(),
+                                display_text: format!("Type \"{keyword} keyword\" to search {name}").into(),
+                                icon_name: icon.clone(),
                                 match_type: MATCH_TYPE_COMPLETION,
                                 relevance: 1.0,
-                                ..Default::default()
-                            },
+                                properties: Default::default(),
+                            }),
                         )
                         .collect();
                 }
@@ -157,13 +150,13 @@ impl KRunnerPlugin {
 }
 
 impl EntryType {
-    fn get_krunner_icon(&self) -> Cow<'static, str> {
+    fn get_krunner_icon(&self) -> Arc<str> {
         match self {
-            EntryType::Class => Cow::Borrowed("class-or-package"),
-            EntryType::Method | EntryType::Function => Cow::Borrowed("code-function"),
-            EntryType::Enum => Cow::Borrowed("enum"),
-            EntryType::Constant => Cow::Borrowed("code-variable"),
-            _ => Cow::Borrowed("")
+            EntryType::Class => Arc::from("class-or-package"),
+            EntryType::Method | EntryType::Function => Arc::from("code-function"),
+            EntryType::Enum => Arc::from("enum"),
+            EntryType::Constant => Arc::from("code-variable"),
+            _ => Arc::from("")
         }
     }
 }
@@ -173,6 +166,7 @@ async fn search_in_doc_sets(
     doc_sets: Vec<DocSet>,
     q: Arc<str>,
 ) -> anyhow::Result<Vec<QueryEntry>> {
+    log::debug!("Search {q} in doc sets: {doc_sets:?}");
     let mut join_set = JoinSet::new();
     for ds in doc_sets {
         let doc_provider = doc_provider.clone();
@@ -180,15 +174,15 @@ async fn search_in_doc_sets(
         join_set.spawn(async move {
             doc_provider.search(&ds.id, q.as_ref()).await
                 .map(move |entries| entries.into_iter().map(move |SearchEntry { entry_type, title, desc, url, relevance }| QueryEntry {
-                    id: Cow::Owned(format!("search-result-{}", url)),
-                    display_text: title.into(),
+                    data: format!("search-result-{}", url).into(),
+                    display_text: title,
                     icon_name: entry_type.get_krunner_icon(),
                     match_type: MATCH_TYPE_EXACT,
                     relevance: (relevance as f64) / 100.0,
                     properties: hashmap! {
-                        QueryPropertyField::Category => ds.name.to_owned().into_owned().into(),
-                        QueryPropertyField::Subtext => desc.into_owned().into(),
-                        QueryPropertyField::Urls => vec![url.into_owned()].into(),
+                        QueryPropertyField::Category => ds.name.to_string().into(),
+                        QueryPropertyField::Subtext => desc.to_string().into(),
+                        QueryPropertyField::Urls => vec![url.to_string()].into(),
                     },
                 }))
         });

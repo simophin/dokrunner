@@ -1,79 +1,108 @@
-use std::borrow::Cow;
-use std::collections::HashMap;
-use std::fs::{File, FileType};
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use serde::Deserialize;
-use sqlx::{FromRow, SqlitePool, Type};
-use tokio::fs::read_dir;
+use serde_json::Value;
+use sqlx::{Row, SqlitePool};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteRow};
+use tokio::fs::{read_dir};
+use tokio::task::spawn_blocking;
 
-use crate::provider::{DocProvider, DocSet, EntryType, SearchEntry};
+use crate::provider::{DocProvider, DocSet, SearchEntry};
+
+const EXTRA_KEYWORDS: &[(&'static str, &'static str)] = &[
+    ("Android", "droid"),
+];
 
 pub struct Dash {
-    doc_set_path: PathBuf,
-    pools: RwLock<HashMap<PathBuf, Arc<SqlitePool>>>,
+    doc_sets: Vec<DashDocSet>,
 }
 
 impl Dash {
-    pub fn new_with_default() -> anyhow::Result<Self> {
-        Ok(Self {
-            doc_set_path: dirs::data_dir()
-                .context("Unable to find data dir")?
-                .join("Zeal")
-                .join("Zeal")
-                .join("docsets"),
-            pools: Default::default(),
-        })
+    pub async fn new_with_default() -> anyhow::Result<Self> {
+        let root = dirs::data_dir()
+            .context("Unable to find data dir")?
+            .join("Zeal")
+            .join("Zeal")
+            .join("docsets");
+
+        let mut entries = read_dir(&root).await.context("Listing docset folder")?;
+        let mut doc_sets = vec![];
+        while let Some(entry) = entries.next_entry().await? {
+            let set = match DashDocSet::new(entry.path()).await {
+                Ok(v) => v,
+                Err(e) => {
+                    log::error!("Ignoring docset folder {}: {e:?}", entry.path().display());
+                    continue;
+                }
+            };
+            doc_sets.push(set);
+        }
+        log::debug!("Parsed doc sets: {doc_sets:#?}");
+        Ok(Self { doc_sets })
     }
 }
 
-const KEYWORD_TO_NAME_MAPPINGS: &[(&'static str, &'static str)] = &[
-    ("droid", "Android"),
-    ("android", "Android"),
-    ("py", "Python_3"),
-];
-
-fn find_names_by_keyword(kw: &str) -> impl Iterator<Item = &str> {
-    let kw_lc = kw.to_ascii_lowercase();
-    KEYWORD_TO_NAME_MAPPINGS
-        .iter()
-        .filter(move |item| item.0.starts_with(&kw_lc))
-        .map(|v| v.1)
+#[derive(Debug)]
+struct DashDocSet {
+    name: Arc<str>,
+    title: Arc<str>,
+    db: SqlitePool,
+    icon: Option<Arc<str>>,
+    keywords: Vec<Arc<str>>,
+    _resource_root: PathBuf,
 }
 
-fn find_keywords_by_name<'a>(name: &str) -> impl Iterator<Item = &str> {
-    KEYWORD_TO_NAME_MAPPINGS
-        .iter()
-        .filter(|item| item.1.eq_ignore_ascii_case(name))
-        .map(|v| v.0)
-}
+impl DashDocSet {
+    async fn new(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let meta_path = path.as_ref().join("meta.json");
+        let meta = spawn_blocking(move || -> anyhow::Result<Value> {
+            Ok(serde_json::from_reader(std::fs::File::open(meta_path).context("Opening meta.json")?)?)
+        }).await??;
 
-#[derive(Deserialize, Default)]
-struct DocSetExtras {
-    keywords: Option<Vec<String>>,
-}
+        let res_dir = path.as_ref().join("Contents").join("Resources");
+        let db = SqlitePool::connect_with(SqliteConnectOptions::default().filename(res_dir.join("docSet.dsidx")).read_only(true)).await.context("Opening database")?;
 
-#[derive(Deserialize)]
-struct DocSetMeta {
-    #[serde(default)]
-    extra: DocSetExtras,
-    name: String,
-    title: String,
-    version: String,
-}
+        let name: Arc<str> = meta.get("name").context("Reading name")?.as_str().context("name is not string")?.into();
+        let title = meta.get("name").context("Reading title")?.as_str().context("title is not string")?.into();
+        let keywords = meta.get("extra").and_then(|extra| extra.get("keywords")).and_then(|keywords| keywords.as_array())
+            .iter()
+            .flat_map(|v| v.iter())
+            .filter_map(|v| v.as_str())
+            .map(|s| s.to_ascii_lowercase().into())
+            .chain(vec![name.to_ascii_lowercase().into()].into_iter())
+            .chain(EXTRA_KEYWORDS.iter().filter(|item| item.0.eq(name.as_ref())).map(|item| item.1.into()))
+            .collect();
 
-#[derive(FromRow, Debug)]
-struct IndexEntry {
-    name: String,
-    #[sqlx(rename="type")]
-    t: String,
-    path: String,
-    fragment: String,
-    relevance: i64,
+        Ok(Self {
+            name,
+            db,
+            title,
+            keywords,
+            icon: Some(path.as_ref().join("icon@2x.png"))
+                .iter()
+                .filter(|p| p.is_file())
+                .filter_map(|p| p.to_str())
+                .map(|s| s.into())
+                .next(),
+            _resource_root: res_dir.join("Documents"),
+        })
+    }
+
+    fn contains_keyword(&self, kw_lc: &str) -> bool {
+        self.keywords.iter().find(|k| k.starts_with(kw_lc)).is_some()
+    }
+
+    fn to_doc_set(&self) -> DocSet {
+        DocSet {
+            id: self.name.clone(),
+            keywords: self.keywords.iter().map(|v| v.clone()).collect(),
+            name: self.name.clone(),
+            description: self.title.clone(),
+            icon: self.icon.clone().unwrap_or_else(|| Arc::from("")),
+        }
+    }
 }
 
 #[async_trait]
@@ -83,67 +112,51 @@ impl DocProvider for Dash {
     }
 
     async fn search_doc_sets(&self, keyword: &str) -> anyhow::Result<Vec<DocSet>> {
-        let mut entries = read_dir(&self.doc_set_path).await?;
-        let mut rs = vec![];
-        while let Some(entry) = entries.next_entry().await? {
-            if !entry.file_type().await?.is_dir() {
-                continue;
-            }
+        let keyword = keyword.to_ascii_lowercase();
 
-            // Try to parse meta
-            let meta_file = entry.path().join("meta.json");
-            let db_file = entry.path().join("Contents").join("Resources").join("docSet.dsidx");
-            if meta_file.is_file() && db_file.is_file() {
-                log::debug!("Opening {}", meta_file.display());
-                let file = File::open(meta_file).context("Opening meta file")?;
-                let DocSetMeta { name, title, extra, .. }: DocSetMeta = serde_json::from_reader(file).context("Parsing meta file")?;
-                let id = db_file.to_str().context("Converting database path")?.to_string();
-                if find_names_by_keyword(keyword).filter(|n| n.eq_ignore_ascii_case(&name)).next().is_some() {
-                    let icon = entry.path().join("icon@2x.png").to_str().context("Converting icon path")?.to_string();
-                    let docset_specified_keywords = extra.keywords.unwrap_or_default();
-                    rs.extend(docset_specified_keywords.iter().map(|v| v.as_ref()).chain(find_keywords_by_name(&name)).map(|kw| DocSet{
-                        id: id.clone().into(),
-                        keyword: kw.to_string().into(),
-                        name: title.clone().into(),
-                        description: title.clone().into(),
-                        icon: icon.clone().into(),
-                    }));
-                }
-            } else {
-                log::warn!("{entry:?} is not a DocSet folder");
-                continue;
-            }
-        }
+        let rs = self.doc_sets
+            .iter()
+            .filter(|set| set.contains_keyword(&keyword))
+            .map(DashDocSet::to_doc_set)
+            .collect();
+        log::debug!("DocSet search result for q = {keyword}: {rs:?}");
         Ok(rs)
     }
 
-
-
     async fn search(&self, doc_set_id: &str, q: &str) -> anyhow::Result<Vec<SearchEntry>> {
-        let  conn = SqlitePool::connect(&format!("sqlite:{doc_set_id}")).await.with_context(|| format!("Opening sqlite db: {doc_set_id}"))?;
-        let entries: Vec<IndexEntry> = sqlx::query_as(r"
+        let doc_set = match self.doc_sets.iter().find(|ds| ds.name.as_ref().eq(doc_set_id)) {
+            Some(v) => v,
+            None => return Ok(vec![]),
+        };
+
+        let entries: Vec<SqliteRow> = sqlx::query(r"
             WITH cte AS (
-                SELECT *, 100 as relevance FROM searchIndex WHERE name = trim(?1) COLLATE NOCASE
-                UNION
-                SELECT *, 70 as relevance FROM searchIndex WHERE name LIKE trim(?1) || '%' COLLATE NOCASE
-                UNION
-                SELECT *, 50 as relevance FROM searchIndex WHERE name LIKE trim(?1) || '%' COLLATE NOCASE
+                SELECT
+                    *,
+                    CASE
+                        WHEN name = trim(?1) THEN 100
+                        WHEN name = trim(?1) COLLATE NOCASE THEN 90
+                        WHEN name LIKE trim(?1) || '%' THEN 80
+                        WHEN name LIKE '%' || trim(?1) THEN 70
+                        WHEN name COLLATE NOCASE LIKE trim(?1) || '%' THEN 60
+                        WHEN name COLLATE NOCASE LIKE '%' || trim(?1) THEN 50
+                        ELSE 0
+                    END as relevance
+                FROM searchIndex
             )
-            SELECT DISTINCT(name) AS name, type, path, fragment, relevance FROM cte ORDER by relevance DESC LIMIT 10
+            SELECT * FROM cte WHERE relevance > 0 ORDER by relevance DESC LIMIT 30
         ")
             .bind(q)
-            .fetch_all(&conn).await.context("Running search SQL")?;
+            .fetch_all(&doc_set.db).await.context("Running search SQL")?;
         log::debug!("Searching for {q} got {} results", entries.len());
-        Ok(entries.into_iter().map(|IndexEntry { name, t, path, fragment, relevance }| SearchEntry {
-            entry_type: EntryType::Class,
-            title: name.into(),
-            desc: Cow::Borrowed(""),
-            url: format!("{path}#{fragment}").into(),
-            relevance: relevance as usize,
+        Ok(entries.into_iter().map(|row| SearchEntry {
+            entry_type: row.get::<&str, _>("type").parse().unwrap(),
+            title: row.get::<String, _>("name").into(),
+            desc: Arc::from(""),
+            url: format!("{}#{}", row.get::<&str, _>("path"), row.try_get::<&str, _>("fragment").unwrap_or("")).into(),
+            relevance: row.get::<i64, _>("relevance") as usize,
         }).collect())
     }
 
-    async fn clean_up(&self) {
-        todo!()
-    }
+    async fn clean_up(&self) {}
 }

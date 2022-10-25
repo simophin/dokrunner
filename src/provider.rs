@@ -1,8 +1,8 @@
-use std::borrow::Cow;
+use std::sync::Arc;
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde_enum_str::Deserialize_enum_str;
 
-#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Deserialize_enum_str, Clone)]
 pub enum EntryType {
     Class,
     Function,
@@ -12,25 +12,26 @@ pub enum EntryType {
     Option,
     Guide,
     Module,
-    Other(String),
+    #[serde(other)]
+    Other(Arc<str>),
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct SearchEntry {
     pub entry_type: EntryType,
-    pub title: Cow<'static, str>,
-    pub desc: Cow<'static, str>,
-    pub url: Cow<'static, str>,
+    pub title: Arc<str>,
+    pub desc: Arc<str>,
+    pub url: Arc<str>,
     pub relevance: usize,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct DocSet {
-    pub id: Cow<'static, str>,
-    pub keyword: Cow<'static, str>,
-    pub name: Cow<'static, str>,
-    pub description: Cow<'static, str>,
-    pub icon: Cow<'static, str>,
+    pub id: Arc<str>,
+    pub keywords: Vec<Arc<str>>,
+    pub name: Arc<str>,
+    pub description: Arc<str>,
+    pub icon: Arc<str>,
 }
 
 #[async_trait]
