@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Row, SqlitePool};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteRow};
@@ -52,6 +53,13 @@ struct DashDocSet {
     icon: Option<Arc<str>>,
     keywords: Vec<Arc<str>>,
     _resource_root: PathBuf,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct EntryId<'a> {
+    name: &'a str,
+    path: &'a str,
+    fragment: Option<&'a str>,
 }
 
 impl DashDocSet {
@@ -149,13 +157,36 @@ impl DocProvider for Dash {
             .bind(q)
             .fetch_all(&doc_set.db).await.context("Running search SQL")?;
         log::debug!("Searching for {q} got {} results", entries.len());
-        Ok(entries.into_iter().map(|row| SearchEntry {
-            entry_type: row.get::<&str, _>("type").parse().unwrap(),
-            title: row.get::<String, _>("name").into(),
-            desc: Arc::from(""),
-            url: format!("{}#{}", row.get::<&str, _>("path"), row.try_get::<&str, _>("fragment").unwrap_or("")).into(),
-            relevance: row.get::<i64, _>("relevance") as usize,
+        Ok(entries.into_iter().map(|row| {
+            let name: &str = row.get("name");
+            let path: &str = row.get("path");
+            let fragment: Option<&str> = row.try_get("fragment").ok();
+            SearchEntry {
+                entry_type: row.get::<&str, _>("type").parse().unwrap(),
+                title: name.into(),
+                desc: Arc::from(""),
+                id: serde_json::to_string(&EntryId {
+                    name,
+                    path,
+                    fragment,
+                }).unwrap().into(),
+                relevance: row.get::<i64, _>("relevance") as usize,
+            }
         }).collect())
+    }
+
+    async fn open(&self, doc_set_id: &str, entry_id: &str) -> anyhow::Result<()> {
+        let entry_id: EntryId = serde_json::from_str(entry_id).context("Parsing ID")?;
+        log::debug!("Opening entry {entry_id:#?} for doc_set {doc_set_id}");
+
+        // web_view::builder()
+        //     .title(&format!("Documentation for {doc_set_id}"))
+        //     .content(Content::Url(entry_url.as_ref()))
+        //     .resizable(true)
+        //     .user_data(())
+        //     .invoke_handler(|_wv, _arg| Ok(()))
+        //     .run()?;
+        Ok(())
     }
 
     async fn clean_up(&self) {}

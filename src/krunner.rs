@@ -1,7 +1,8 @@
 use std::{collections::HashMap, sync::Arc, vec};
+use anyhow::Context;
 
 use maplit::hashmap;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::task::{JoinError, JoinSet};
 use zbus::{
     dbus_interface,
@@ -43,7 +44,7 @@ const MATCH_TYPE_EXACT: MatchType = 100;
 #[serde(rename_all = "lowercase")]
 enum QueryPropertyField {
     Category,
-    Urls,
+    // Urls,
     Subtext,
 }
 
@@ -55,6 +56,19 @@ struct QueryEntry {
     match_type: MatchType,
     relevance: f64,
     properties: HashMap<QueryPropertyField, Value<'static>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq, Clone)]
+enum EntryData {
+    DocSet {
+        provider: Arc<str>,
+        id: Arc<str>,
+    },
+    Entry {
+        provider: Arc<str>,
+        doc_set_id: Arc<str>,
+        url: Arc<str>,
+    },
 }
 
 type VariantMap<'a> = HashMap<&'a str, Value<'static>>;
@@ -104,14 +118,20 @@ impl KRunnerPlugin {
                                  keywords,
                                  icon,
                                  ..
-                             }| keywords.into_iter().map(move |keyword| QueryEntry {
-                                data: format!("docset-intro-{id}").into(),
-                                display_text: format!("Type \"{keyword} keyword\" to search {name}").into(),
-                                icon_name: icon.clone(),
-                                match_type: MATCH_TYPE_COMPLETION,
-                                relevance: 1.0,
-                                properties: Default::default(),
-                            }),
+                             }| {
+                                let provider_name: Arc<str> = p.name().into();
+                                keywords.into_iter().map(move |keyword| QueryEntry {
+                                    data: serde_json::to_string(&EntryData::DocSet {
+                                        provider: provider_name.clone(),
+                                        id: id.clone(),
+                                    }).unwrap().into(),
+                                    display_text: format!("Type \"{keyword} keyword\" to search {name}").into(),
+                                    icon_name: icon.clone(),
+                                    match_type: MATCH_TYPE_COMPLETION,
+                                    relevance: 1.0,
+                                    properties: Default::default(),
+                                })
+                            },
                         )
                         .collect();
                 }
@@ -140,7 +160,18 @@ impl KRunnerPlugin {
     }
 
     async fn run(&self, data: &str, action_id: &str) -> Result<()> {
-        log::debug!("Run {data} with {action_id}");
+        let data: EntryData = serde_json::from_str(data)
+            .context("Parsing entry data")
+            .map_err(|e| Error::Failed(format!("{e:?}")))?;
+        log::debug!("Run {data:?} with {action_id}");
+
+        if let EntryData::Entry { provider, doc_set_id, url } = data {
+            if let Some(provider) = self.providers.iter().find(|p| p.name() == provider.as_ref()) {
+                provider.open(doc_set_id.as_ref(), url.as_ref()).await
+                    .map_err(|e| Error::Failed(format!("{e:?}")))?;
+            }
+        }
+
         Ok(())
     }
 
@@ -173,8 +204,8 @@ async fn search_in_doc_sets(
         let q = q.clone();
         join_set.spawn(async move {
             doc_provider.search(&ds.id, q.as_ref()).await
-                .map(move |entries| entries.into_iter().map(move |SearchEntry { entry_type, title, desc, url, relevance }| QueryEntry {
-                    data: format!("search-result-{}", url).into(),
+                .map(move |entries| entries.into_iter().map(move |SearchEntry { entry_type, title, desc, id: url, relevance }| QueryEntry {
+                    data: serde_json::to_string(&EntryData::Entry { provider: doc_provider.name().into(), doc_set_id: ds.id.clone(), url }).unwrap().into(),
                     display_text: title,
                     icon_name: entry_type.get_krunner_icon(),
                     match_type: MATCH_TYPE_EXACT,
@@ -182,7 +213,7 @@ async fn search_in_doc_sets(
                     properties: hashmap! {
                         QueryPropertyField::Category => ds.name.to_string().into(),
                         QueryPropertyField::Subtext => desc.to_string().into(),
-                        QueryPropertyField::Urls => vec![url.to_string()].into(),
+                        // QueryPropertyField::Urls => vec![url.to_string()].into(),
                     },
                 }))
         });

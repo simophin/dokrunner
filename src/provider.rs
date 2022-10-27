@@ -21,7 +21,7 @@ pub struct SearchEntry {
     pub entry_type: EntryType,
     pub title: Arc<str>,
     pub desc: Arc<str>,
-    pub url: Arc<str>,
+    pub id: Arc<str>,
     pub relevance: usize,
 }
 
@@ -39,5 +39,6 @@ pub trait DocProvider {
     fn name(&self) -> &str;
     async fn search_doc_sets(&self, keyword: &str) -> anyhow::Result<Vec<DocSet>>;
     async fn search(&self, doc_set_id: &str, q: &str) -> anyhow::Result<Vec<SearchEntry>>;
+    async fn open(&self, doc_set_id: &str, entry_url: &str) -> anyhow::Result<()>;
     async fn clean_up(&self);
 }
